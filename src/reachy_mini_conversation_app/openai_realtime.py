@@ -103,6 +103,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         self.connection: AsyncRealtimeConnection | None = None
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
+        self._subscriber_queues: list[asyncio.Queue] = [self.output_queue]
 
         self.last_activity_time = asyncio.get_event_loop().time()
         self.start_time = asyncio.get_event_loop().time()
@@ -136,8 +137,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._last_response_rejected: bool = False
 
     def copy(self) -> "OpenaiRealtimeHandler":
-        """Create a copy of the handler."""
-        return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
+        """Return the same handler instance to share the session between participants."""
+        return self
+
+    def register_queue(self, q: asyncio.Queue) -> None:
+        """Register an extra output queue for broadcasting."""
+        if q not in self._subscriber_queues:
+            self._subscriber_queues.append(q)
+
+    async def _broadcast_output(self, item: Tuple[int, NDArray[np.int16]] | AdditionalOutputs) -> None:
+        """Broadcast an item to all registered output queues."""
+        for q in self._subscriber_queues:
+            await q.put(item)
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a new personality (profile) at runtime if possible.
@@ -207,7 +218,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             input_transcript = self.input_transcript_chunks_by_item
             if input_transcript.item_id == item_id and len(input_transcript.deltas) - 1 == sequence_counter:
-                await self.output_queue.put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
+                await self._broadcast_output(AdditionalOutputs({"role": "user_partial", "content": transcript}))
                 logger.debug(f"Debounced partial emitted: {transcript}")
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
@@ -215,6 +226,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
+        if self.connection is not None:
+            logger.info("Realtime session already connected; skipping start_up")
+            return
+
         openai_api_key = config.OPENAI_API_KEY
         if self.gradio_mode and not openai_api_key:
             # api key was not found in .env or in the environment variables
@@ -402,7 +417,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     },
                 )
 
-            await self.output_queue.put(
+            await self._broadcast_output(
                 AdditionalOutputs(
                     {
                         "role": "assistant",
@@ -445,7 +460,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         rgb_frame = None
                     img = gr.Image(value=rgb_frame)
 
-                    await self.output_queue.put(
+                    await self._broadcast_output(
                         AdditionalOutputs(
                             {
                                 "role": "assistant",
@@ -600,12 +615,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             except asyncio.CancelledError:
                                 pass
 
-                        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": event.transcript}))
+                        await self._broadcast_output(AdditionalOutputs({"role": "user", "content": event.transcript}))
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         logger.debug(f"Assistant transcript: {event.transcript}")
-                        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
+                        await self._broadcast_output(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
@@ -613,7 +628,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             self.deps.head_wobbler.feed(event.delta)
                         self.last_activity_time = asyncio.get_event_loop().time()
                         logger.debug("last activity time updated to %s", self.last_activity_time)
-                        await self.output_queue.put(
+                        await self._broadcast_output(
                             (
                                 self.output_sample_rate,
                                 np.frombuffer(base64.b64decode(event.delta), dtype=np.int16).reshape(1, -1),
@@ -650,7 +665,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             is_idle_tool_call=self.is_idle_tool_call,
                         )
 
-                        await self.output_queue.put(
+                        await self._broadcast_output(
                             AdditionalOutputs(
                                 {
                                     "role": "assistant",
@@ -681,7 +696,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                         # Only show user-facing errors, not internal state errors
                         if code not in ("input_audio_buffer_commit_empty",):
-                            await self.output_queue.put(
+                            await self._broadcast_output(
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:

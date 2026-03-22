@@ -181,7 +181,13 @@ def run(
 
     handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
 
-    stream_manager: gr.Blocks | LocalStream | None = None
+    # Always initialize LocalStream for robot hardware audio
+    stream_manager = LocalStream(
+        handler,
+        robot,
+        settings_app=settings_app,
+        instance_path=instance_path,
+    )
 
     if args.gradio:
         api_key_textbox = gr.Textbox(
@@ -208,7 +214,7 @@ def run(
             additional_outputs_handler=update_chatbot,
             ui_args={"title": "Talk with Reachy Mini"},
         )
-        stream_manager = stream.ui
+        # In Gradio mode, we still use stream_manager for hardware loops but mount Gradio UI
         if not settings_app:
             app = FastAPI()
             app.mount("/static", StaticFiles(directory=os.path.join(current_file_path, "static")), name="static")
@@ -222,7 +228,7 @@ def run(
         if camera_worker:
             app.add_api_route("/video_feed", video_feed)
 
-        personality_ui.wire_events(handler, stream_manager)
+        personality_ui.wire_events(handler, stream.ui)
 
         app = gr.mount_gradio_app(app, stream.ui, path="/chat")
         
@@ -230,18 +236,8 @@ def run(
         def _root() -> FileResponse:
             index_file = os.path.join(current_file_path, "static", "index.html")
             return FileResponse(index_file)
-    else:
-        # In headless mode, wire settings_app + instance_path to console LocalStream
-        stream_manager = LocalStream(
-            handler,
-            robot,
-            settings_app=settings_app,
-            instance_path=instance_path,
-        )
 
     # Each async service → its own thread/loop
-    # movement_manager.start()
-    # head_wobbler.start()
     if camera_worker:
         camera_worker.start()
     if vision_manager:
@@ -263,6 +259,13 @@ def run(
 
     try:
         if args.gradio:
+            # When running uvicorn, we need to start the hardware loops in the background
+            # using a lifespan or a manual task. Since uvicorn.run is blocking, we use 
+            # a startup event.
+            @app.on_event("startup")
+            async def startup_event() -> None:
+                stream_manager.start()
+            
             uvicorn.run(app, host="0.0.0.0", port=7860)
         else:
             stream_manager.launch()
@@ -300,9 +303,6 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
         asyncio.set_event_loop(loop)
 
         args, _ = parse_args()
-
-        # is_wireless = reachy_mini.client.get_status()["wireless_version"]
-        # args.head_tracker = None if is_wireless else "mediapipe"
 
         instance_path = self._get_instance_path().parent
         run(

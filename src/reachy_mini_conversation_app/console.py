@@ -14,11 +14,13 @@ import sys
 import time
 import asyncio
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from pathlib import Path
 
-from fastrtc import AdditionalOutputs, audio_to_float32
+from fastrtc import AdditionalOutputs, audio_to_float32, wait_for_item
 from scipy.signal import resample
+from numpy.typing import NDArray
+import numpy as np
 
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
@@ -305,12 +307,58 @@ class LocalStream:
 
         self._settings_initialized = True
 
-    def launch(self) -> None:
-        """Start the recorder/player and run the async processing loops.
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """Start the recorder/player and processing loops in the background.
 
-        If the OpenAI key is missing, expose a tiny settings UI via the
-        Reachy Mini settings server to collect it before starting streams.
+        - loop: optional event loop to use. If None, uses the current loop.
         """
+        self._stop_event.clear()
+
+        # Start media
+        self._robot.media.start_recording()
+        self._robot.media.start_playing()
+        time.sleep(1)  # give some time to the pipelines to start
+
+        async def runner() -> None:
+            # Capture loop for cross-thread personality actions
+            self._asyncio_loop = asyncio.get_running_loop()
+            # Mount personality routes now that loop and handler are available
+            try:
+                if self._settings_app is not None:
+                    mount_personality_routes(
+                        self._settings_app,
+                        self.handler,
+                        lambda: self._asyncio_loop,
+                        persist_personality=self._persist_personality,
+                        get_persisted_personality=self._read_persisted_personality,
+                    )
+            except Exception:
+                pass
+
+            # Use our own queue for broadcasted output
+            my_queue: asyncio.Queue = asyncio.Queue()
+            self.handler.register_queue(my_queue)
+
+            self._tasks = [
+                asyncio.create_task(self.handler.start_up(), name="openai-handler"),
+                asyncio.create_task(self.record_loop(), name="stream-record-loop"),
+                asyncio.create_task(self.play_loop_custom_queue(my_queue), name="stream-play-loop"),
+            ]
+            try:
+                await asyncio.gather(*self._tasks)
+            except asyncio.CancelledError:
+                logger.info("Tasks cancelled during shutdown")
+            finally:
+                # Ensure handler connection is closed
+                await self.handler.shutdown()
+
+        if loop is None:
+            asyncio.create_task(runner())
+        else:
+            loop.create_task(runner())
+
+    def launch(self) -> None:
+        """Start the recorder/player and run the async processing loops (blocking)."""
         self._stop_event.clear()
 
         # Try to load an existing instance .env first (covers subsequent runs)
@@ -369,41 +417,47 @@ class LocalStream:
                 logger.info("Interrupted while waiting for API key.")
                 return
 
-        # Start media after key is set/available
+        asyncio.run(self._launch_runner())
+
+    async def _launch_runner(self) -> None:
+        """Async runner for the blocking launch() method."""
+        # Capture loop for cross-thread personality actions
+        loop = asyncio.get_running_loop()
+        self._asyncio_loop = loop  # type: ignore[assignment]
+        # Mount personality routes now that loop and handler are available
+        try:
+            if self._settings_app is not None:
+                mount_personality_routes(
+                    self._settings_app,
+                    self.handler,
+                    lambda: self._asyncio_loop,
+                    persist_personality=self._persist_personality,
+                    get_persisted_personality=self._read_persisted_personality,
+                )
+        except Exception:
+            pass
+
+        # Start media
         self._robot.media.start_recording()
         self._robot.media.start_playing()
-        time.sleep(1)  # give some time to the pipelines to start
+        time.sleep(1)
 
-        async def runner() -> None:
-            # Capture loop for cross-thread personality actions
-            loop = asyncio.get_running_loop()
-            self._asyncio_loop = loop  # type: ignore[assignment]
-            # Mount personality routes now that loop and handler are available
-            try:
-                if self._settings_app is not None:
-                    mount_personality_routes(
-                        self._settings_app,
-                        self.handler,
-                        lambda: self._asyncio_loop,
-                        persist_personality=self._persist_personality,
-                        get_persisted_personality=self._read_persisted_personality,
-                    )
-            except Exception:
-                pass
-            self._tasks = [
-                asyncio.create_task(self.handler.start_up(), name="openai-handler"),
-                asyncio.create_task(self.record_loop(), name="stream-record-loop"),
-                asyncio.create_task(self.play_loop(), name="stream-play-loop"),
-            ]
-            try:
-                await asyncio.gather(*self._tasks)
-            except asyncio.CancelledError:
-                logger.info("Tasks cancelled during shutdown")
-            finally:
-                # Ensure handler connection is closed
-                await self.handler.shutdown()
+        # Use our own queue for broadcasted output
+        my_queue: asyncio.Queue = asyncio.Queue()
+        self.handler.register_queue(my_queue)
 
-        asyncio.run(runner())
+        self._tasks = [
+            asyncio.create_task(self.handler.start_up(), name="openai-handler"),
+            asyncio.create_task(self.record_loop(), name="stream-record-loop"),
+            asyncio.create_task(self.play_loop_custom_queue(my_queue), name="stream-play-loop"),
+        ]
+        try:
+            await asyncio.gather(*self._tasks)
+        except asyncio.CancelledError:
+            logger.info("Tasks cancelled during shutdown")
+        finally:
+            # Ensure handler connection is closed
+            await self.handler.shutdown()
 
     def close(self) -> None:
         """Stop the stream and underlying media pipelines.
@@ -459,10 +513,10 @@ class LocalStream:
                 await self.handler.receive((input_sample_rate, audio_frame))
             await asyncio.sleep(0)  # avoid busy loop
 
-    async def play_loop(self) -> None:
-        """Fetch outputs from the handler: log text and play audio frames."""
+    async def play_loop_custom_queue(self, queue: asyncio.Queue) -> None:
+        """Fetch outputs from a specific queue: log text and play audio frames."""
         while not self._stop_event.is_set():
-            handler_output = await self.handler.emit()
+            handler_output = await wait_for_item(queue)
 
             if isinstance(handler_output, AdditionalOutputs):
                 for msg in handler_output.args:
